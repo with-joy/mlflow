@@ -34,7 +34,9 @@ from mlflow.store.artifact.artifact_repo import (
     MultipartUploadMixin,
     PresignedUploadMixin,
     _is_object_key_within_path,
+    _validate_attachment_path,
 )
+from mlflow.tracing.utils.artifact_utils import TRACE_DATA_FILE_NAME
 from mlflow.utils.file_utils import relative_path_to_artifact_path
 
 _logger = logging.getLogger(__name__)
@@ -333,9 +335,9 @@ class S3ArtifactRepository(
         else:
             return None
 
-    def _upload_file(self, s3_client, local_file, bucket, key):
+    def _get_upload_extra_args(self, path):
         extra_args = {}
-        guessed_type, guessed_encoding = guess_type(local_file)
+        guessed_type, guessed_encoding = guess_type(path)
         if guessed_type is not None:
             extra_args["ContentType"] = guessed_type
         if guessed_encoding is not None:
@@ -344,7 +346,33 @@ class S3ArtifactRepository(
         environ_extra_args = self.get_s3_file_upload_extra_args()
         if environ_extra_args is not None:
             extra_args.update(environ_extra_args)
+        return extra_args
+
+    def _upload_file(self, s3_client, local_file, bucket, key):
+        extra_args = self._get_upload_extra_args(local_file)
         s3_client.upload_file(Filename=local_file, Bucket=bucket, Key=key, ExtraArgs=extra_args)
+
+    def _upload_bytes(self, artifact_path, body):
+        from boto3.s3.transfer import TransferConfig
+
+        # Threads are off so the upload runs on the calling thread: s3transfer's worker threads
+        # don't inherit the suppressed-instrumentation context that trace export runs in.
+        # Large bodies still use multipart.
+        (bucket, dest_path) = self.parse_s3_compliant_uri(self.artifact_uri)
+        self._get_s3_client().upload_fileobj(
+            BytesIO(body),
+            bucket,
+            posixpath.join(dest_path, artifact_path),
+            ExtraArgs=self._get_upload_extra_args(artifact_path),
+            Config=TransferConfig(use_threads=False),
+        )
+
+    def upload_trace_data(self, trace_data: str) -> None:
+        self._upload_bytes(TRACE_DATA_FILE_NAME, trace_data.encode("utf-8"))
+
+    def upload_attachment(self, attachment_id: str, content_bytes: bytes) -> None:
+        _validate_attachment_path(attachment_id)
+        self._upload_bytes(posixpath.join("attachments", attachment_id), content_bytes)
 
     def log_artifact(self, local_file, artifact_path=None):
         """
