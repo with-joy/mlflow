@@ -180,8 +180,20 @@ class AsyncTraceExportQueue:
                 # put() calls cannot enqueue work that no consumer will process.
                 self._is_active = False
                 self._stop_event.set()
+                # Wake the consumer if it waits in `get(timeout=1)` on an empty queue, so the
+                # join below does not wait for the timeout. Queued after `set()`, so the consumer
+                # sees the stop event when it wakes. A full queue does not need this.
+                try:
+                    self._queue.put_nowait(Task(handler=lambda: None, args=()))
+                except queue_Full:
+                    pass
 
             self._consumer_thread.join()
+            # The consumer exits once it sees the stop event and an empty queue, which can happen
+            # before the wake-up is queued. Run what it left, or the join below never returns.
+            while not self._queue.empty():
+                self._queue.get_nowait().handle()
+                self._queue.task_done()
 
             # Wait for all tasks to be processed
             self._queue.join()

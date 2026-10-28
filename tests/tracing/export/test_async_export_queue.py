@@ -178,6 +178,49 @@ def test_concurrent_put_during_flush_does_not_deadlock(terminate):
         queue.flush(terminate=True)
 
 
+def test_flush_does_not_wait_for_idle_consumer_poll(monkeypatch):
+    queue = AsyncTraceExportQueue()
+    polling = threading.Event()
+    get = queue._queue.get
+
+    def slow_poll(timeout):
+        polling.set()
+        # Much longer than the real 1 s poll, so a flush that waits for it stands out.
+        return get(timeout=10)
+
+    monkeypatch.setattr(queue._queue, "get", slow_poll)
+    queue.activate()
+    assert polling.wait(timeout=5)
+
+    start = time.monotonic()
+    queue.flush(terminate=True)
+
+    assert time.monotonic() - start < 5
+
+
+def test_flush_returns_when_consumer_exits_before_wake_up(monkeypatch):
+    queue = AsyncTraceExportQueue()
+    queue.activate()
+    consumer = queue._consumer_thread
+    set_stop_event = queue._stop_event.set
+
+    def set_and_wait_for_consumer_exit():
+        set_stop_event()
+        # The flushing thread is descheduled right after setting the event, until the consumer
+        # has seen it and exited.
+        consumer.join(timeout=10)
+
+    monkeypatch.setattr(queue._stop_event, "set", set_and_wait_for_consumer_exit)
+    flush_thread = threading.Thread(
+        target=queue.flush, kwargs={"terminate": True}, name="test-flush", daemon=True
+    )
+    flush_thread.start()
+    flush_thread.join(timeout=10)
+
+    assert not consumer.is_alive()
+    assert not flush_thread.is_alive()
+
+
 def test_flush_waits_for_in_progress_flush():
     queue = AsyncTraceExportQueue()
     release = threading.Event()
