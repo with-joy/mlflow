@@ -1,7 +1,7 @@
 import logging
 import os
 import threading
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import nullcontext
 from typing import Sequence
 
@@ -36,6 +36,8 @@ _logger = logging.getLogger(__name__)
 
 # HTTP statuses that mean the caller's credential was rejected.
 _AUTH_FAILURE_STATUS_CODES = (401, 403)
+
+_LOG_TRACE_ERROR_MSG = "Failed to log trace to the trace server."
 
 
 def _is_auth_failure(exc: Exception) -> bool:
@@ -93,6 +95,13 @@ class MlflowV3SpanExporter(SpanExporter):
         # if log_spans() raises NotImplementedError or returns a 501.
         self._store_supports_log_spans = True
 
+        # Async `_log_spans` tasks in flight per MLflow trace ID, and the `_log_trace` tasks
+        # parked until they finish. `start_trace` must run after the trace's spans are logged,
+        # because the TraceInfo it returns decides whether `traces.json` is uploaded too.
+        self._pending_log_spans: Counter[str] = Counter()
+        self._parked_log_traces: dict[str, Task] = {}
+        self._pending_lock = threading.Lock()
+
         # Root spans deferred when background thread spans are still running at export time.
         # Keyed by OTel trace ID; popped and exported once all spans in the trace have ended.
         # Protected by _deferred_lock because SimpleSpanProcessor calls export() from the
@@ -134,13 +143,21 @@ class MlflowV3SpanExporter(SpanExporter):
             spans_to_log,
         ) in mlflow_spans_by_experiment_and_workspace.items():
             if self._should_log_async():
-                self._async_queue.put(
-                    task=Task(
-                        handler=self._log_spans,
-                        args=(experiment_id, spans_to_log, workspace),
-                        error_msg="Failed to log spans to the trace server.",
+                trace_ids = {span.trace_id for span in spans_to_log}
+                with self._pending_lock:
+                    self._pending_log_spans.update(trace_ids)
+                queued = False
+                try:
+                    queued = self._async_queue.put(
+                        task=Task(
+                            handler=self._log_spans_and_release,
+                            args=(experiment_id, spans_to_log, workspace, trace_ids),
+                            error_msg="Failed to log spans to the trace server.",
+                        )
                     )
-                )
+                finally:
+                    if not queued:
+                        self._release_log_spans(trace_ids)
             else:
                 self._log_spans(experiment_id, spans_to_log, workspace=workspace)
 
@@ -256,13 +273,49 @@ class MlflowV3SpanExporter(SpanExporter):
         if self._should_log_async():
             self._async_queue.put(
                 task=Task(
-                    handler=self._log_trace,
+                    handler=self._log_trace_after_spans,
                     args=(trace, manager_trace.prompts, workspace),
-                    error_msg="Failed to log trace to the trace server.",
+                    error_msg=_LOG_TRACE_ERROR_MSG,
                 )
             )
         else:
             self._log_trace(trace, prompts=manager_trace.prompts, workspace=workspace)
+
+    def _log_spans_and_release(
+        self, experiment_id: str, spans: list[Span], workspace: str | None, trace_ids: set[str]
+    ) -> None:
+        try:
+            self._log_spans(experiment_id, spans, workspace)
+        finally:
+            self._release_log_spans(trace_ids)
+
+    def _log_trace_after_spans(
+        self, trace: Trace, prompts: Sequence[PromptVersion], workspace: str | None
+    ) -> None:
+        with self._pending_lock:
+            if self._pending_log_spans[trace.info.trace_id]:
+                # Park instead of blocking this worker; `_release_log_spans` resumes it.
+                self._parked_log_traces[trace.info.trace_id] = Task(
+                    handler=self._log_trace,
+                    args=(trace, prompts, workspace),
+                    error_msg=_LOG_TRACE_ERROR_MSG,
+                )
+                return
+        self._log_trace(trace, prompts, workspace)
+
+    def _release_log_spans(self, trace_ids: set[str]) -> None:
+        ready = []
+        with self._pending_lock:
+            self._pending_log_spans.subtract(trace_ids)
+            for trace_id in trace_ids:
+                if self._pending_log_spans[trace_id] <= 0:
+                    del self._pending_log_spans[trace_id]
+                    if (task := self._parked_log_traces.pop(trace_id, None)) is not None:
+                        ready.append(task)
+        # One batch can release several traces. Run their `_log_trace` calls in parallel, as
+        # without parking, not one after another here. Not through `put()`: it discards tasks
+        # when the queue is full, and runs them on this thread while the queue is flushing.
+        self._async_queue.run_in_parallel(ready)
 
     def _log_spans(
         self, experiment_id: str, spans: list[Span], workspace: str | None = None

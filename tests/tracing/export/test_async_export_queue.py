@@ -1,7 +1,9 @@
+import concurrent.futures.thread
 import multiprocessing
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Callable
 from unittest import mock
 
 import pytest
@@ -102,7 +104,7 @@ def test_put_after_terminate_executes_synchronously():
     assert queue._stop_event.is_set()
 
     # Calling put() after termination must not deadlock; task must run synchronously.
-    queue.put(Task(handler=calls.append, args=(2,)))
+    assert queue.put(Task(handler=calls.append, args=(2,)))
 
     assert calls == [1, 2]
 
@@ -122,15 +124,125 @@ def test_async_queue_drop_task_when_full(monkeypatch):
         nonlocal processed_tasks
         processed_tasks += 1
 
-    for _ in range(10):
-        task = Task(handler=slow_handler, args=())
-        queue.put(task)
+    queued = [queue.put(Task(handler=slow_handler, args=())) for _ in range(10)]
 
     queue.flush(terminate=True)
 
     # One more task than the queue size might be processed, because the first task
     # can be drained from the queue immediately, which creates a slot for another task
     assert processed_tasks <= 4
+    # put() reports exactly the tasks it discarded
+    assert queued.count(True) == processed_tasks
+
+
+def _wait_until(condition: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + 10
+    while not condition():
+        if time.monotonic() > deadline:
+            raise TimeoutError("Condition was not met within 10 seconds")
+        time.sleep(0.01)
+
+
+def _parallel_follow_ups(on_done: Callable[[], None]) -> list[Task]:
+    # Passes only if both tasks run at the same time.
+    barrier = threading.Barrier(2, timeout=5)
+
+    def follow_up():
+        barrier.wait()
+        on_done()
+
+    return [Task(handler=follow_up, args=()) for _ in range(2)]
+
+
+@pytest.mark.parametrize("terminate", [False, True])
+def test_flush_waits_for_follow_ups_run_in_parallel(terminate):
+    queue = AsyncTraceExportQueue()
+    done = []
+
+    def on_done():
+        # Finish only once flush() has started and the task that started this one is done, so
+        # only the worker shutdown in flush() can wait for it.
+        _wait_until(lambda: queue._stop_event.is_set() and queue._queue.unfinished_tasks == 0)
+        done.append(threading.current_thread())
+
+    queue.put(Task(handler=queue.run_in_parallel, args=(_parallel_follow_ups(on_done),)))
+    queue.flush(terminate=terminate)
+
+    assert len(done) == 2
+    assert all(t.name.startswith("MlflowTraceLoggingWorker") for t in done)
+
+    if not terminate:
+        queue.flush(terminate=True)
+
+
+def test_run_in_parallel_after_terminate_waits_for_tasks_on_new_threads():
+    queue = AsyncTraceExportQueue()
+    queue.activate()
+    queue.flush(terminate=True)
+    done = []
+
+    queue.run_in_parallel(_parallel_follow_ups(lambda: done.append(threading.current_thread())))
+
+    assert len(done) == 2
+    assert threading.current_thread() not in done
+
+
+def test_run_in_parallel_after_terminate_runs_at_most_max_workers_tasks_at_once(monkeypatch):
+    monkeypatch.setenv("MLFLOW_ASYNC_TRACE_LOGGING_MAX_WORKERS", "2")
+    queue = AsyncTraceExportQueue()
+    queue.activate()
+    queue.flush(terminate=True)
+    running = []
+    release = threading.Event()
+
+    def follow_up():
+        running.append(threading.current_thread())
+        release.wait(timeout=10)
+
+    caller = threading.Thread(
+        target=queue.run_in_parallel,
+        args=([Task(handler=follow_up, args=())] * 3,),
+        name="test-run-in-parallel",
+    )
+    caller.start()
+
+    def follow_up_threads():
+        return [t for t in threading.enumerate() if t.name == "MlflowTraceLoggingFollowUp"]
+
+    _wait_until(lambda: len(follow_up_threads()) == 3 and len(running) >= 2)
+    assert len(running) == 2
+    release.set()
+    caller.join(timeout=10)
+
+    assert not caller.is_alive()
+    assert len(set(running)) == 3
+
+
+def exit_during_task_process(counter):
+    # The process exits while the queued task runs. The task waits until concurrent.futures has
+    # shut the worker pool down, then hands its follow-ups to run_in_parallel().
+    queue = AsyncTraceExportQueue()
+
+    def increment():
+        with counter.get_lock():
+            counter.value += 1
+
+    def handler():
+        _wait_until(lambda: concurrent.futures.thread._shutdown)
+        queue.run_in_parallel(_parallel_follow_ups(increment))
+
+    queue.put(Task(handler=handler, args=()))
+
+
+@skip_when_testing_trace_sdk
+def test_run_in_parallel_at_interpreter_exit():
+    multiprocessing.set_start_method("spawn", force=True)
+    counter = multiprocessing.Value("i", 0)
+    process = multiprocessing.Process(target=exit_during_task_process, args=(counter,))
+    process.start()
+    process.join(timeout=15)
+
+    assert counter.value == 2
 
 
 @pytest.mark.parametrize("terminate", [False, True])

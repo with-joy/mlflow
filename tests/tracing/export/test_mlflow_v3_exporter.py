@@ -15,7 +15,7 @@ from mlflow.entities.span_event import SpanEvent
 from mlflow.entities.trace import Trace
 from mlflow.entities.trace_info import TraceInfo
 from mlflow.entities.trace_location import MlflowExperimentLocation
-from mlflow.exceptions import MlflowException
+from mlflow.exceptions import MlflowException, RestException
 from mlflow.protos import service_pb2 as pb
 from mlflow.protos.databricks_pb2 import (
     PERMISSION_DENIED,
@@ -1134,3 +1134,252 @@ def test_export_does_not_populate_serving_buffer_outside_model_serving(monkeypat
 
     assert inference_table.pop_trace("req-serving-2") is None
     inference_table._TRACE_BUFFER.clear()
+
+
+def _register_trace(otel_trace_id: int, with_child: bool = True) -> list[LiveSpan]:
+    """Registers a trace and returns its spans in the order they end."""
+    now_ns = time.time_ns()
+    root = create_mock_otel_span(
+        name="root",
+        trace_id=otel_trace_id,
+        span_id=1,
+        start_time=now_ns - 2_000_000,
+        end_time=now_ns,
+    )
+    trace_id = generate_trace_id_v3(root)
+    trace_manager = InMemoryTraceManager.get_instance()
+    trace_manager.register_trace(otel_trace_id, create_test_trace_info(trace_id, _EXPERIMENT_ID))
+    trace_manager.register_span(LiveSpan(root, trace_id))
+    if not with_child:
+        return [root]
+    child = create_mock_otel_span(
+        name="child",
+        trace_id=otel_trace_id,
+        span_id=2,
+        parent_id=1,
+        start_time=now_ns - 1_000_000,
+        end_time=now_ns - 500_000,
+    )
+    trace_manager.register_span(LiveSpan(child, trace_id))
+    return [child, root]
+
+
+def _hold_log_spans(
+    exporter: MlflowV3SpanExporter, exported: threading.Event, held_tasks: int
+) -> None:
+    # Holds a log_spans() call back, like a slow tracking server, until the test has exported
+    # its spans and every queued task other than the held `_log_spans` tasks is done. Each
+    # trace's `_log_trace` task has then either called start_trace() before the trace's spans
+    # were logged, or parked.
+    queue = exporter._async_queue._queue
+    deadline = time.monotonic() + 10
+    while not exported.is_set() or queue.unfinished_tasks > held_tasks:
+        if time.monotonic() > deadline:
+            raise TimeoutError("Queued tasks did not finish")
+        time.sleep(0.01)
+
+
+@pytest.mark.parametrize("split_batches", [False, True])
+def test_async_start_trace_runs_after_log_spans_of_same_trace(split_batches):
+    spans = _register_trace(otel_trace_id=88888)
+    exporter = MlflowV3SpanExporter()
+    exported = threading.Event()
+    events = []
+
+    def log_spans(location, spans):
+        _hold_log_spans(exporter, exported, held_tasks=2 if split_batches else 1)
+        events.append("log_spans")
+
+    def start_trace(trace_info):
+        events.append("start_trace")
+        # Like SqlAlchemyStore: spans logged before start_trace() mark the trace TRACKING_STORE.
+        if "log_spans" in events:
+            trace_info.tags[TraceTagKey.SPANS_LOCATION] = SpansLocation.TRACKING_STORE.value
+        return trace_info
+
+    with (
+        mock.patch(
+            "mlflow.tracing.client.TracingClient.log_spans", side_effect=log_spans
+        ) as mock_log_spans,
+        mock.patch(
+            "mlflow.tracing.client.TracingClient.start_trace", side_effect=start_trace
+        ) as mock_start_trace,
+        mock.patch("mlflow.tracing.client.TracingClient._upload_trace_data") as mock_upload,
+    ):
+        if split_batches:
+            exporter.export(spans[:1])
+            exporter.export(spans[1:])
+        else:
+            exporter.export(spans)
+        exported.set()
+        exporter._async_queue.flush(terminate=True)
+
+    assert mock_log_spans.call_count == (2 if split_batches else 1)
+    mock_start_trace.assert_called_once()
+    assert events == ["log_spans"] * mock_log_spans.call_count + ["start_trace"]
+    mock_upload.assert_not_called()
+    assert exporter._pending_log_spans == {}
+    assert exporter._parked_log_traces == {}
+
+
+def test_async_traces_released_by_one_log_spans_call_are_logged_in_parallel():
+    roots = [
+        _register_trace(otel_trace_id, with_child=False)[0] for otel_trace_id in (111, 222, 333)
+    ]
+    trace_ids = [generate_trace_id_v3(root) for root in roots]
+    exporter = MlflowV3SpanExporter()
+    exported = threading.Event()
+    events = []
+    # Passes only if the three start_trace() calls are in flight at the same time.
+    barrier = threading.Barrier(len(roots), timeout=5)
+
+    def log_spans(location, spans):
+        _hold_log_spans(exporter, exported, held_tasks=1)
+        events.append("log_spans")
+
+    def start_trace(trace_info):
+        barrier.wait()
+        events.append("start_trace")
+        if trace_info.trace_id == trace_ids[0]:
+            raise MlflowException("Failed to start trace")
+        return trace_info
+
+    with (
+        mock.patch(
+            "mlflow.tracing.client.TracingClient.log_spans", side_effect=log_spans
+        ) as mock_log_spans,
+        mock.patch(
+            "mlflow.tracing.client.TracingClient.start_trace", side_effect=start_trace
+        ) as mock_start_trace,
+        mock.patch("mlflow.tracing.client.TracingClient._upload_trace_data") as mock_upload,
+    ):
+        # One export() call, so one `_log_spans` task covers all three traces.
+        exporter.export(roots)
+        exported.set()
+        exporter._async_queue.flush(terminate=True)
+
+    mock_log_spans.assert_called_once()
+    assert not barrier.broken
+    assert events == ["log_spans"] + ["start_trace"] * len(roots)
+    assert sorted(c.args[0].trace_id for c in mock_start_trace.call_args_list) == sorted(trace_ids)
+    # The failing trace does not stop the others.
+    assert sorted(c.args[0].trace_id for c in mock_upload.call_args_list) == sorted(trace_ids[1:])
+    assert exporter._pending_log_spans == {}
+    assert exporter._parked_log_traces == {}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        NotImplementedError(),
+        RestException({
+            "error_code": "NOT_IMPLEMENTED",
+            "message": "REST OTLP span logging is not supported by FileStore",
+        }),
+        RestException({"error_code": "INTERNAL_ERROR", "message": "Failed to log spans"}),
+        ConnectionError("Tracking server is unreachable"),
+    ],
+)
+def test_async_trace_data_uploaded_when_log_spans_fails(error):
+    spans = _register_trace(otel_trace_id=99999)
+    events = []
+
+    def log_spans(location, spans):
+        events.append("log_spans")
+        raise error
+
+    def start_trace(trace_info):
+        events.append("start_trace")
+        return trace_info
+
+    with (
+        mock.patch(
+            "mlflow.tracing.client.TracingClient.log_spans", side_effect=log_spans
+        ) as mock_log_spans,
+        mock.patch(
+            "mlflow.tracing.client.TracingClient.start_trace", side_effect=start_trace
+        ) as mock_start_trace,
+        mock.patch("mlflow.tracing.client.TracingClient._upload_trace_data") as mock_upload,
+    ):
+        exporter = MlflowV3SpanExporter()
+        exporter.export(spans)
+        exporter._async_queue.flush(terminate=True)
+
+    mock_log_spans.assert_called_once()
+    mock_start_trace.assert_called_once()
+    assert events == ["log_spans", "start_trace"]
+    mock_upload.assert_called_once()
+
+
+def test_async_start_trace_waits_for_queued_batch_when_another_batch_is_discarded():
+    child, root = _register_trace(otel_trace_id=77778)
+    exporter = MlflowV3SpanExporter()
+    exported = threading.Event()
+    events = []
+    put = exporter._async_queue.put
+    put_tasks = []
+
+    def put_discarding_root_batch(task):
+        put_tasks.append(task)
+        # The second task is the root batch's `_log_spans`. Discard it as a full queue would.
+        if len(put_tasks) == 2:
+            return False
+        return put(task)
+
+    def log_spans(location, spans):
+        _hold_log_spans(exporter, exported, held_tasks=1)
+        events.append("log_spans")
+
+    def start_trace(trace_info):
+        events.append("start_trace")
+        if "log_spans" in events:
+            trace_info.tags[TraceTagKey.SPANS_LOCATION] = SpansLocation.TRACKING_STORE.value
+        return trace_info
+
+    with (
+        mock.patch.object(
+            exporter._async_queue, "put", side_effect=put_discarding_root_batch
+        ) as mock_put,
+        mock.patch(
+            "mlflow.tracing.client.TracingClient.log_spans", side_effect=log_spans
+        ) as mock_log_spans,
+        mock.patch(
+            "mlflow.tracing.client.TracingClient.start_trace", side_effect=start_trace
+        ) as mock_start_trace,
+        mock.patch("mlflow.tracing.client.TracingClient._upload_trace_data") as mock_upload,
+    ):
+        exporter.export([child])
+        exporter.export([root])
+        exported.set()
+        exporter._async_queue.flush(terminate=True)
+
+    assert mock_put.call_count == 3
+    # Only the child batch was logged. start_trace() still runs, after it.
+    mock_log_spans.assert_called_once()
+    mock_start_trace.assert_called_once()
+    assert events == ["log_spans", "start_trace"]
+    mock_upload.assert_not_called()
+    assert exporter._pending_log_spans == {}
+    assert exporter._parked_log_traces == {}
+
+
+def test_async_export_to_sql_store_does_not_upload_trace_data(tmp_path):
+    experiment_id = mlflow.create_experiment("sql-store", artifact_location=tmp_path.as_uri())
+    mlflow.set_experiment(experiment_id=experiment_id)
+    for i in range(20):
+        with mlflow.start_span(f"root-{i}"):
+            # More spans than MLFLOW_ASYNC_TRACE_LOGGING_MAX_SPAN_BATCH_SIZE, so a trace's spans
+            # are split across export() calls.
+            for j in range(6):
+                with mlflow.start_span(f"child-{j}"):
+                    pass
+    mlflow.flush_trace_async_logging()
+
+    traces = mlflow.search_traces(
+        locations=[experiment_id], include_spans=False, return_type="list"
+    )
+    assert len(traces) == 20
+    assert {t.info.tags[TraceTagKey.SPANS_LOCATION] for t in traces} == {
+        SpansLocation.TRACKING_STORE.value
+    }
+    assert list(tmp_path.glob("traces/*/artifacts/traces.json")) == []

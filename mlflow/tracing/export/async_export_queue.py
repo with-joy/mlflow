@@ -45,6 +45,8 @@ class AsyncTraceExportQueue:
         # deadlock with a concurrent put().
         self._flush_lock = threading.Lock()
         self._max_workers = MLFLOW_ASYNC_TRACE_LOGGING_MAX_WORKERS.get()
+        # At most `max_workers` refused follow-up tasks run at once (see `run_in_parallel`).
+        self._follow_up_slots = threading.BoundedSemaphore(self._max_workers)
 
         # Thread event that indicates the queue should stop processing tasks
         self._stop_event = threading.Event()
@@ -54,8 +56,13 @@ class AsyncTraceExportQueue:
 
         atexit.register(self._at_exit_callback)
 
-    def put(self, task: Task):
-        """Put a new task to the queue for processing."""
+    def put(self, task: Task) -> bool:
+        """
+        Put a new task to the queue for processing.
+
+        Returns:
+            False if the task was discarded because the queue is full, True otherwise.
+        """
         with self._lock:
             if not self.is_active():
                 if not self._stop_event.is_set():
@@ -77,10 +84,50 @@ class AsyncTraceExportQueue:
                             " environment variable."
                         )
                         self._last_full_queue_warning_time = time.time()
-                return
+                    return False
+                return True
 
         # Queue is flushing or was terminated; execute synchronously.
         task.handle()
+        return True
+
+    def run_in_parallel(self, tasks: Sequence[Task]) -> None:
+        """
+        Run follow-up tasks in parallel, outside the bounded queue, such as work that a queued
+        task unblocks. The tasks go to the workers. ``flush()`` waits for them, because it shuts
+        the workers down with ``wait=True`` after the queued tasks are done.
+
+        The workers refuse tasks after ``flush()`` shut them down, and at interpreter exit, where
+        ``concurrent.futures`` stops every pool from taking tasks before atexit callbacks run.
+        Refused tasks run on new threads, at most ``max_workers`` of them at once, and this call
+        waits for them. The tasks must not call ``run_in_parallel()`` themselves: a refused task
+        that does holds a slot while it waits for slots, which can deadlock.
+        """
+        refused = []
+        for task in tasks:
+            try:
+                self._worker_threadpool.submit(task.handle)
+            except RuntimeError:
+                refused.append(task)
+
+        threads = []
+        for task in refused:
+            thread = threading.Thread(
+                target=self._handle_refused, args=(task,), name="MlflowTraceLoggingFollowUp"
+            )
+            try:
+                thread.start()
+            except RuntimeError:
+                # Starting a thread fails too once the interpreter is finalizing.
+                task.handle()
+            else:
+                threads.append(thread)
+        for thread in threads:
+            thread.join()
+
+    def _handle_refused(self, task: Task) -> None:
+        with self._follow_up_slots:
+            task.handle()
 
     def _consumer_loop(self) -> None:
         while not self._stop_event.is_set():
